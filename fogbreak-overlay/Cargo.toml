@@ -1,0 +1,48 @@
+[package]
+name = "fogbreak-raster"
+description = "Fogbreak Raster Studio (browser WebGPU with WebGL2 fallback, page canvas host)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.95"
+publish = false
+
+[features]
+heif = ["photocraft-codecs/heif"]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "fogbreak-raster"
+path = "src/main.rs"
+
+[dependencies]
+egui = { workspace = true }
+log = { workspace = true }
+photocraft-codecs = { workspace = true }
+photocraft-doc = { workspace = true }
+photocraft-engine = { workspace = true }
+photocraft-io = { workspace = true }
+photocraft-raster = { workspace = true }
+photocraft-ui-egui = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+eframe = { workspace = true, features = ["wgpu", "accesskit", "clipboard"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "Location",
+    "MediaQueryList",
+    "Event",
+    "EventTarget",
+    "CustomEvent",
+    "CustomEventInit",
+] }

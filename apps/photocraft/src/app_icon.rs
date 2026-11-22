@@ -17,13 +17,7 @@
 /// Window, taskbar and (when running unbundled) Dock icon. macOS gets the padded 1024 px render
 /// on Apple's icon grid; elsewhere the 256 px hicolor render of the full tile.
 pub fn window_icon() -> egui::IconData {
-    match eframe::icon_data::from_png_bytes(PNG) {
-        Ok(icon) => icon,
-        Err(e) => {
-            log::warn!("app icon: {e}");
-            egui::IconData::default()
-        }
-    }
+    egui::IconData::default()
 }
 
 /// Whether the window gets [`window_icon`] at runtime: everywhere except inside a macOS app
@@ -52,10 +46,7 @@ fn in_app_bundle(exe: &std::path::Path) -> bool {
         && name(bundle).is_some_and(|n| n.len() > 4 && n.to_ascii_lowercase().ends_with(".app"))
 }
 
-#[cfg(target_os = "macos")]
-const PNG: &[u8] = include_bytes!("../../../assets/app-icon/photocraft-1024.png");
-#[cfg(not(target_os = "macos"))]
-const PNG: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/256x256/apps/ai.storyteller.photocraft.png");
+const PNG: &[u8] = &[];
 
 #[cfg(test)]
 mod tests {
