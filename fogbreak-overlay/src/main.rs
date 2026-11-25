@@ -41,12 +41,62 @@ mod web {
                             .unwrap_or_else(|| vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
                         let _ = tx.send(Ok(png));
                     }
+                    HostCommand::Export { format, tx } => {
+                        let _ = tx.send(self.export_bytes(&format));
+                    }
+                    HostCommand::Import { name, bytes, tx } => {
+                        let _ = tx.send(self.import_bytes(&name, &bytes));
+                    }
                     HostCommand::Request { method, params, tx } => {
                         let out = self.handle_request(&method, &params);
                         let _ = tx.send(out);
                     }
                 }
             }
+        }
+
+        fn export_bytes(&self, format: &str) -> Result<Vec<u8>, String> {
+            let fmt = format.trim().trim_start_matches('.').to_ascii_lowercase();
+            let ext = match fmt.as_str() {
+                "psd" | "png" | "webp" | "tiff" | "pdf" => fmt.as_str(),
+                "tif" => "tiff",
+                _ => return Err(format!("unsupported export format `{fmt}`")),
+            };
+            let st = self.app.session.active().ok_or_else(|| "no active document".to_string())?;
+            photocraft_io::export(&st.doc, &format!("export.{ext}"), &Default::default())
+                .map(|r| r.bytes)
+                .map_err(|e| e.to_string())
+        }
+
+        fn import_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<Value, String> {
+            let warnings = self.app.open_bytes(name, bytes)?;
+            Ok(json!({
+                "ok": true,
+                "name": name,
+                "byteLength": bytes.len(),
+                "warnings": warnings,
+            }))
+        }
+
+        fn describe_command(&self, command: &str) -> Value {
+            let spec = photocraft_engine::commands::find(command).or_else(|| {
+                photocraft_engine::command_specs()
+                    .iter()
+                    .find(|c| c.id.eq_ignore_ascii_case(command))
+            });
+            let Some(spec) = spec else {
+                return Value::Null;
+            };
+            let mut entry = photocraft_engine::commands::list_entry(
+                &self.app.session,
+                spec,
+                (spec.enabled)(&self.app.session).err(),
+            );
+            if let Some(map) = entry.as_object_mut() {
+                map.insert("summary".to_string(), Value::String(spec.label.to_string()));
+                map.insert("mutates".to_string(), Value::Bool(spec.journal));
+            }
+            entry
         }
 
         fn handle_request(&mut self, method: &str, params: &Value) -> Result<Value, String> {
@@ -57,16 +107,9 @@ mod web {
                     "theme": if self.dark { "dark" } else { "light" },
                     "dirty": self.app.has_unsaved_work(),
                 })),
-                "command.list" => {
-                    let v = self.app.run("command.list", params.clone())?;
-                    if let Some(arr) = v.as_array() {
-                        let ids: Vec<Value> = arr
-                            .iter()
-                            .filter_map(|row| row.get("id").and_then(Value::as_str).map(|s| Value::String(s.to_string())))
-                            .collect();
-                        return Ok(Value::Array(ids));
-                    }
-                    Ok(v)
+                "__describe_command" => {
+                    let id = params.get("command").and_then(Value::as_str).unwrap_or("");
+                    Ok(self.describe_command(id))
                 }
                 _ => self.app.run(method, params.clone()),
             }
@@ -171,7 +214,11 @@ mod web {
                         {
                             app.set_wgpu(rs);
                         }
-                        host_bridge::emit_ready(&[]);
+                        let caps: Vec<String> = photocraft_engine::command_specs()
+                            .iter()
+                            .map(|c| c.id.to_string())
+                            .collect();
+                        host_bridge::emit_ready(&caps);
                         Ok(Box::new(Shell {
                             app,
                             queue: queue_for_cb,

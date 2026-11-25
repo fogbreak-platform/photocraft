@@ -4,12 +4,13 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::mpsc::{Sender, TryRecvError, channel};
 
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use serde_json::{Value, json};
 use wasm_bindgen::JsCast as _;
+use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 
 pub const ENGINE_ID: &str = "fogbreak-raster";
@@ -17,14 +18,25 @@ pub const HOST_KEY: &str = "fogbreakRasterHost";
 pub const CANVAS_ID: &str = "fogbreak_raster_canvas";
 pub const LOADING_ID: &str = "fogbreak_raster_loading";
 
+const EXPORT_FORMATS: [&str; 5] = ["psd", "png", "webp", "tiff", "pdf"];
+
 pub enum HostCommand {
     Request {
         method: String,
         params: Value,
-        tx: std::sync::mpsc::Sender<Result<Value, String>>,
+        tx: Sender<Result<Value, String>>,
     },
     Screenshot {
-        tx: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+        tx: Sender<Result<Vec<u8>, String>>,
+    },
+    Export {
+        format: String,
+        tx: Sender<Result<Vec<u8>, String>>,
+    },
+    Import {
+        name: String,
+        bytes: Vec<u8>,
+        tx: Sender<Result<Value, String>>,
     },
     OpenBytes {
         name: String,
@@ -179,15 +191,21 @@ pub fn install_rpc(queue: CommandQueue, ctx: egui::Context) {
     let _ = Reflect::set(&handle, &"hostMode".into(), &JsValue::from_str("page"));
     let _ = Reflect::set(&handle, &"engineId".into(), &JsValue::from_str(ENGINE_ID));
 
-    {
-        let q = queue.clone();
-        let c = ctx.clone();
-        let f = Closure::<dyn Fn(String, JsValue) -> Promise>::new(move |method: String, params: JsValue| {
-            dispatch_req(q.clone(), c.clone(), method, parse_params(&params))
-        });
-        let _ = Reflect::set(&handle, &"request".into(), f.as_ref().unchecked_ref());
-        f.forget();
-    }
+    install_request_fns(&handle, &queue, &ctx);
+    install_inspect_fns(&handle, &queue, &ctx);
+    install_io_fns(&handle, &queue, &ctx);
+
+    let _ = Reflect::set(&window, &JsValue::from_str(HOST_KEY), &handle);
+}
+
+fn install_request_fns(handle: &Object, queue: &CommandQueue, ctx: &egui::Context) {
+    let q = queue.clone();
+    let c = ctx.clone();
+    let req_fn = Closure::<dyn Fn(String, JsValue) -> Promise>::new(move |method: String, params: JsValue| {
+        dispatch_req(q.clone(), c.clone(), method, parse_params(&params))
+    });
+    let _ = Reflect::set(handle, &"request".into(), req_fn.as_ref().unchecked_ref());
+    req_fn.forget();
 
     for alias in ["execute", "executeCommand"] {
         let q = queue.clone();
@@ -195,90 +213,188 @@ pub fn install_rpc(queue: CommandQueue, ctx: egui::Context) {
         let f = Closure::<dyn Fn(String, JsValue) -> Promise>::new(move |command: String, params: JsValue| {
             dispatch_req(q.clone(), c.clone(), command, parse_params(&params))
         });
-        let _ = Reflect::set(&handle, &JsValue::from_str(alias), f.as_ref().unchecked_ref());
+        let _ = Reflect::set(handle, &JsValue::from_str(alias), f.as_ref().unchecked_ref());
         f.forget();
     }
 
-    {
+    for alias in ["commands", "listCommands"] {
         let q = queue.clone();
         let c = ctx.clone();
         let f = Closure::<dyn Fn() -> Promise>::new(move || {
             dispatch_req(q.clone(), c.clone(), "command.list".to_string(), json!({}))
         });
-        let _ = Reflect::set(&handle, &"commands".into(), f.as_ref().unchecked_ref());
+        let _ = Reflect::set(handle, &JsValue::from_str(alias), f.as_ref().unchecked_ref());
         f.forget();
     }
 
+    let q = queue.clone();
+    let c = ctx.clone();
+    let desc_fn = Closure::<dyn Fn(String) -> Promise>::new(move |command: String| {
+        dispatch_req(q.clone(), c.clone(), "__describe_command".to_string(), json!({ "command": command }))
+    });
+    let _ = Reflect::set(handle, &"describeCommand".into(), desc_fn.as_ref().unchecked_ref());
+    desc_fn.forget();
+}
+
+fn install_inspect_fns(handle: &Object, queue: &CommandQueue, ctx: &egui::Context) {
     for alias in ["docInspect", "inspect"] {
         let q = queue.clone();
         let c = ctx.clone();
         let f = Closure::<dyn Fn(JsValue) -> Promise>::new(move |params: JsValue| {
             dispatch_req(q.clone(), c.clone(), "document.inspect".to_string(), parse_params(&params))
         });
-        let _ = Reflect::set(&handle, &JsValue::from_str(alias), f.as_ref().unchecked_ref());
+        let _ = Reflect::set(handle, &JsValue::from_str(alias), f.as_ref().unchecked_ref());
         f.forget();
     }
 
-    {
-        let q = queue.clone();
-        let c = ctx.clone();
-        let f = Closure::<dyn Fn(JsValue) -> Promise>::new(move |params: JsValue| {
-            dispatch_req(q.clone(), c.clone(), "__ui_inspect".to_string(), parse_params(&params))
-        });
-        let _ = Reflect::set(&handle, &"uiInspect".into(), f.as_ref().unchecked_ref());
-        f.forget();
-    }
+    let q = queue.clone();
+    let c = ctx.clone();
+    let ui_fn = Closure::<dyn Fn(JsValue) -> Promise>::new(move |params: JsValue| {
+        dispatch_req(q.clone(), c.clone(), "__ui_inspect".to_string(), parse_params(&params))
+    });
+    let _ = Reflect::set(handle, &"uiInspect".into(), ui_fn.as_ref().unchecked_ref());
+    ui_fn.forget();
 
-    {
-        let q = queue.clone();
-        let c = ctx.clone();
-        let f = Closure::<dyn Fn(JsValue) -> Promise>::new(move |_params: JsValue| {
-            let q2 = q.clone();
-            let c2 = c.clone();
-            future_to_promise(async move {
-                let (tx, rx) = std::sync::mpsc::channel();
-                q2.push(HostCommand::Screenshot { tx });
-                c2.request_repaint();
-                loop {
-                    if let Ok(res) = rx.try_recv() {
-                        return match res {
-                            Ok(bytes) => Ok(Uint8Array::from(bytes.as_slice()).into()),
-                            Err(e) => Err(JsValue::from_str(&e)),
-                        };
-                    }
-                    sleep_ms(16).await;
+    let q = queue.clone();
+    let c = ctx.clone();
+    let shot_fn = Closure::<dyn Fn(JsValue) -> Promise>::new(move |_params: JsValue| {
+        let q2 = q.clone();
+        let c2 = c.clone();
+        future_to_promise(async move {
+            let (tx, rx) = channel();
+            q2.push(HostCommand::Screenshot { tx });
+            c2.request_repaint();
+            loop {
+                match rx.try_recv() {
+                    Ok(Ok(bytes)) => return Ok(Uint8Array::from(bytes.as_slice()).into()),
+                    Ok(Err(e)) => return Err(JsValue::from_str(&e)),
+                    Err(TryRecvError::Empty) => sleep_ms(16).await,
+                    Err(TryRecvError::Disconnected) => return Err(JsValue::from_str("screenshot request dropped")),
                 }
-            })
-        });
-        let _ = Reflect::set(&handle, &"screenshot".into(), f.as_ref().unchecked_ref());
-        f.forget();
-    }
+            }
+        })
+    });
+    let _ = Reflect::set(handle, &"screenshot".into(), shot_fn.as_ref().unchecked_ref());
+    shot_fn.forget();
+}
 
-    {
-        let q = queue.clone();
-        let c = ctx.clone();
-        let f = Closure::<dyn Fn(String, JsValue) -> Promise>::new(move |name: String, bytes: JsValue| {
+fn install_io_fns(handle: &Object, queue: &CommandQueue, ctx: &egui::Context) {
+    let q = queue.clone();
+    let c = ctx.clone();
+    let open_fn = Closure::<dyn Fn(String, JsValue) -> Promise>::new(move |name: String, bytes: JsValue| {
+        let data = Uint8Array::new(&bytes).to_vec();
+        q.push(HostCommand::OpenBytes { name, bytes: data });
+        c.request_repaint();
+        future_to_promise(async { Ok(JsValue::TRUE) })
+    });
+    let _ = Reflect::set(handle, &"open".into(), open_fn.as_ref().unchecked_ref());
+    open_fn.forget();
+
+    let handoff_fn = Closure::<dyn Fn(String, String, String, JsValue)>::new(
+        |target_shore: String, artifact_name: String, format: String, bytes: JsValue| {
             let data = Uint8Array::new(&bytes).to_vec();
-            q.push(HostCommand::OpenBytes { name, bytes: data });
+            emit_handoff(&target_shore, &artifact_name, &format, &data);
+        },
+    );
+    let _ = Reflect::set(handle, &"emitHandoff".into(), handoff_fn.as_ref().unchecked_ref());
+    handoff_fn.forget();
+
+    install_native_io_object(handle, queue, ctx);
+}
+
+fn install_native_io_object(handle: &Object, queue: &CommandQueue, ctx: &egui::Context) {
+    let io_obj = Object::new();
+
+    let formats_fn = Closure::<dyn Fn() -> Promise>::new(|| {
+        future_to_promise(async {
+            let arr: Vec<Value> = EXPORT_FORMATS.iter().map(|f| Value::String((*f).to_string())).collect();
+            Ok(to_js(&Value::Array(arr)))
+        })
+    });
+    let _ = Reflect::set(&io_obj, &"formats".into(), formats_fn.as_ref().unchecked_ref());
+    formats_fn.forget();
+
+    let exp_q = queue.clone();
+    let exp_c = ctx.clone();
+    let export_fn = Closure::<dyn Fn(String, JsValue) -> Promise>::new(move |format: String, _params: JsValue| {
+        let q = exp_q.clone();
+        let c = exp_c.clone();
+        future_to_promise(async move {
+            let (tx, rx) = channel();
+            q.push(HostCommand::Export { format, tx });
             c.request_repaint();
-            future_to_promise(async { Ok(JsValue::TRUE) })
-        });
-        let _ = Reflect::set(&handle, &"open".into(), f.as_ref().unchecked_ref());
-        f.forget();
-    }
+            loop {
+                match rx.try_recv() {
+                    Ok(Ok(bytes)) => return Ok(Uint8Array::from(bytes.as_slice()).into()),
+                    Ok(Err(e)) => return Err(JsValue::from_str(&e)),
+                    Err(TryRecvError::Empty) => sleep_ms(16).await,
+                    Err(TryRecvError::Disconnected) => return Err(JsValue::from_str("export request dropped")),
+                }
+            }
+        })
+    });
+    let _ = Reflect::set(&io_obj, &"export".into(), export_fn.as_ref().unchecked_ref());
+    export_fn.forget();
 
-    {
-        let f = Closure::<dyn Fn(String, String, String, JsValue)>::new(
-            |target_shore: String, artifact_name: String, format: String, bytes: JsValue| {
-                let data = Uint8Array::new(&bytes).to_vec();
-                emit_handoff(&target_shore, &artifact_name, &format, &data);
-            },
-        );
-        let _ = Reflect::set(&handle, &"emitHandoff".into(), f.as_ref().unchecked_ref());
-        f.forget();
-    }
+    let imp_q = queue.clone();
+    let imp_c = ctx.clone();
+    let import_fn = Closure::<dyn Fn(JsValue) -> Promise>::new(move |detail: JsValue| {
+        let q = imp_q.clone();
+        let c = imp_c.clone();
+        let parsed = extract_import_detail(&detail);
+        future_to_promise(async move {
+            let (name, bytes) = parsed.map_err(|e| JsValue::from_str(&e))?;
+            let (tx, rx) = channel();
+            q.push(HostCommand::Import { name, bytes, tx });
+            c.request_repaint();
+            loop {
+                match rx.try_recv() {
+                    Ok(Ok(val)) => return Ok(to_js(&val)),
+                    Ok(Err(e)) => return Err(JsValue::from_str(&e)),
+                    Err(TryRecvError::Empty) => sleep_ms(16).await,
+                    Err(TryRecvError::Disconnected) => return Err(JsValue::from_str("import request dropped")),
+                }
+            }
+        })
+    });
+    let _ = Reflect::set(&io_obj, &"import".into(), import_fn.as_ref().unchecked_ref());
+    import_fn.forget();
 
-    let _ = Reflect::set(&window, &JsValue::from_str(HOST_KEY), &handle);
+    let _ = Reflect::set(handle, &"io".into(), &io_obj);
+}
+
+fn infer_raster_ext(mime: Option<&str>) -> &'static str {
+    match mime.unwrap_or("").to_ascii_lowercase().as_str() {
+        "image/vnd.adobe.photoshop" | "application/x-photoshop" => "psd",
+        "image/webp" => "webp",
+        "image/tiff" => "tiff",
+        "application/pdf" => "pdf",
+        "image/jpeg" => "jpg",
+        _ => "png",
+    }
+}
+
+fn extract_import_detail(detail: &JsValue) -> Result<(String, Vec<u8>), String> {
+    let mime = Reflect::get(detail, &"mimeType".into())
+        .ok()
+        .and_then(|v| v.as_string());
+    let raw_name = Reflect::get(detail, &"name".into())
+        .ok()
+        .and_then(|v| v.as_string())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let name = match raw_name {
+        Some(n) if n.contains('.') => n,
+        Some(n) => format!("{n}.{}", infer_raster_ext(mime.as_deref())),
+        None => format!("image.{}", infer_raster_ext(mime.as_deref())),
+    };
+    let bytes_val = Reflect::get(detail, &"bytes".into())
+        .map_err(|_| "import requires a `bytes` Uint8Array".to_string())?;
+    let bytes = Uint8Array::new(&bytes_val).to_vec();
+    if bytes.is_empty() {
+        return Err("import requires non-empty bytes".to_string());
+    }
+    Ok((name, bytes))
 }
 
 fn dispatch_req(queue: CommandQueue, ctx: egui::Context, method: String, params: Value) -> Promise {
